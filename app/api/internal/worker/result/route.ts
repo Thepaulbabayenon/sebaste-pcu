@@ -7,7 +7,6 @@ import { and, eq } from "drizzle-orm";
 import { db } from "@/app/db";
 import { pcuSubmissions } from "@/app/db/schema";
 
-export const runtime = "nodejs";
 
 const payloadSchema = z.object({
   submissionId: z.string().uuid(),
