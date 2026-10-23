@@ -286,6 +286,11 @@ export async function POST(request: Request) {
         errorCode: saved.errorCode,
         verificationStatus: saved.verificationStatus,
       });
+      console.info("PCU_SHEETS_SYNC_DIAGNOSTIC", {
+        submissionId: saved.id,
+        success: result.success,
+        targetSheet: result.targetSheet ?? null,
+        });
 
       sheetsWritten = result.success;
       targetSheet = result.targetSheet;
