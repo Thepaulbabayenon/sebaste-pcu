@@ -7,9 +7,14 @@ import {
   text,
   date,
   timestamp,
+  integer,
   index,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
+
+// =====================================================
+// ENUMS
+// =====================================================
 
 export const outcomeEnum = pgEnum("pcu_outcome", [
   "SUCCESS",
@@ -39,6 +44,19 @@ export const verificationEnum = pgEnum(
   ]
 );
 
+// Tracks asynchronous AI extraction.
+export const aiStatusEnum = pgEnum("pcu_ai_status", [
+  "PENDING",
+  "PROCESSING",
+  "COMPLETED",
+  "FAILED",
+  "SKIPPED",
+]);
+
+// =====================================================
+// PCU SUBMISSIONS
+// =====================================================
+
 export const pcuSubmissions = pgTable(
   "pcu_submissions",
   {
@@ -51,6 +69,10 @@ export const pcuSubmissions = pgTable(
     submittedOutcome: outcomeEnum(
       "submitted_outcome"
     ).notNull(),
+
+    // -------------------------------------------------
+    // PATIENT INFORMATION
+    // -------------------------------------------------
 
     firstName: varchar("first_name", {
       length: 100,
@@ -85,11 +107,19 @@ export const pcuSubmissions = pgTable(
 
     assignedClinic: text("assigned_clinic"),
 
+    // -------------------------------------------------
+    // PRIVATE SCREENSHOT STORAGE
+    // -------------------------------------------------
+
     screenshotKey: text(
       "screenshot_key"
     ).notNull(),
 
     ocrRawText: text("ocr_raw_text"),
+
+    // -------------------------------------------------
+    // CLASSIFICATION AND RHU VERIFICATION
+    // -------------------------------------------------
 
     classification: classificationEnum(
       "classification"
@@ -110,6 +140,45 @@ export const pcuSubmissions = pgTable(
       .notNull()
       .default("PENDING"),
 
+    // -------------------------------------------------
+    // PRIVATE AI WORKER QUEUE
+    // -------------------------------------------------
+
+    aiStatus: aiStatusEnum("ai_status")
+      .notNull()
+      .default("PENDING"),
+
+    // Number of times a worker claimed the job.
+    aiAttempts: integer("ai_attempts")
+      .notNull()
+      .default(0),
+
+    // Unique token assigned to the current claim.
+    // Must be checked by the result endpoint.
+    aiLeaseToken: uuid("ai_lease_token"),
+
+    // Expiration of the current worker claim.
+    aiLeaseExpiresAt: timestamp(
+      "ai_lease_expires_at",
+      { withTimezone: true }
+    ),
+
+    // Time AI extraction was successfully completed.
+    aiProcessedAt: timestamp(
+      "ai_processed_at",
+      { withTimezone: true }
+    ),
+
+    // Safe internal error code only.
+    // Never store sensitive exception details here.
+    aiLastError: varchar("ai_last_error", {
+      length: 100,
+    }),
+
+    // -------------------------------------------------
+    // TIMESTAMPS
+    // -------------------------------------------------
+
     submittedAt: timestamp("submitted_at", {
       withTimezone: true,
     })
@@ -123,15 +192,33 @@ export const pcuSubmissions = pgTable(
       .defaultNow(),
   },
   (table) => [
-    index("pcu_barangay_idx").on(table.barangay),
+    index("pcu_barangay_idx").on(
+      table.barangay
+    ),
+
     index("pcu_submission_date_idx").on(
       table.submittedAt
     ),
+
     index("pcu_transaction_idx").on(
       table.transactionNumber
     ),
+
+    index("pcu_ai_queue_idx").on(
+      table.aiStatus,
+      table.submittedAt
+    ),
+
+    index("pcu_ai_lease_idx").on(
+      table.aiStatus,
+      table.aiLeaseExpiresAt
+    ),
   ]
 );
+
+// =====================================================
+// REGISTRATION CASES
+// =====================================================
 
 export const registrationCases = pgTable(
   "registration_cases",
@@ -162,32 +249,39 @@ export const registrationCases = pgTable(
       .defaultNow(),
   },
   (table) => [
-    uniqueIndex("registration_submission_unique").on(
-      table.submissionId
-    ),
+    uniqueIndex(
+      "registration_submission_unique"
+    ).on(table.submissionId),
   ]
 );
 
-export const auditLogs = pgTable("audit_logs", {
-  id: uuid("id").primaryKey().defaultRandom(),
+// =====================================================
+// AUDIT LOGS
+// =====================================================
 
-  submissionId: uuid("submission_id").references(
-    () => pcuSubmissions.id
-  ),
+export const auditLogs = pgTable(
+  "audit_logs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
 
-  action: varchar("action", {
-    length: 100,
-  }).notNull(),
+    submissionId: uuid(
+      "submission_id"
+    ).references(() => pcuSubmissions.id),
 
-  actor: varchar("actor", {
-    length: 100,
-  }).notNull(),
+    action: varchar("action", {
+      length: 100,
+    }).notNull(),
 
-  details: text("details"),
+    actor: varchar("actor", {
+      length: 100,
+    }).notNull(),
 
-  createdAt: timestamp("created_at", {
-    withTimezone: true,
-  })
-    .notNull()
-    .defaultNow(),
-});
+    details: text("details"),
+
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+    })
+      .notNull()
+      .defaultNow(),
+  }
+);
