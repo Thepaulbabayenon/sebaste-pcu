@@ -1,324 +1,269 @@
 
 import { NextResponse } from "next/server";
-import { randomUUID } from "node:crypto";
+import { and, eq, gt } from "drizzle-orm";
 import { z } from "zod";
-import sharp from "sharp";
-import { eq } from "drizzle-orm";
 
 import { db } from "@/app/db";
 import { pcuSubmissions } from "@/app/db/schema";
-import { BARANGAYS } from "@/app/lib/barangays";
 
-import {
-  saveScreenshot,
-  deleteScreenshot,
-} from "@/app/lib/storage";
-
-import {
-  syncSubmissionToSheets,
-} from "@/app/lib/google-sheets";
+import { isAuthorizedWorker } from "@/app/lib/worker-auth";
+import { classifyPCU } from "@/app/lib/pcu-classification";
+import { syncSubmissionToSheets } from "@/app/lib/google-sheets";
 
 // =====================================================
 // CONFIGURATION
 // =====================================================
 
-const MAX_SIZE = 5 * 1024 * 1024;
+const MAX_ATTEMPTS = 3;
 
 // =====================================================
-// FORM VALIDATION
+// WORKER PAYLOAD VALIDATION
 // =====================================================
 
-const submissionSchema = z.discriminatedUnion(
-  "outcome",
-  [
-    z.object({
-      outcome: z.literal("SUCCESS"),
-      barangay: z.enum(BARANGAYS),
-    }),
+const extractionSchema = z.object({
+  transactionNumber: z.string().nullable(),
+  pin: z.string().nullable(),
+  firstName: z.string().nullable(),
+  middleName: z.string().nullable(),
+  lastName: z.string().nullable(),
+  birthDate: z.string().nullable(),
+  errorCode: z.string().nullable(),
+  assignedClinic: z.string().nullable(),
+});
 
-    z.object({
-      outcome: z.literal("FAILED"),
-      barangay: z.enum(BARANGAYS),
+const payloadSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("COMPLETED"),
+    submissionId: z.string().uuid(),
+    leaseToken: z.string().uuid(),
+    extraction: extractionSchema,
+  }),
+  z.object({
+    status: z.literal("FAILED"),
+    submissionId: z.string().uuid(),
+    leaseToken: z.string().uuid(),
+    errorCode: z.enum([
+      "OLLAMA_UNAVAILABLE",
+      "OLLAMA_TIMEOUT",
+      "OLLAMA_INVALID_RESPONSE",
+      "SCREENSHOT_DOWNLOAD_FAILED",
+      "AI_PROCESSING_FAILED",
+    ]),
+  }),
+]);
 
-      firstName: z.string().trim().min(1).max(100),
-      middleName: z.string().trim().max(100),
-      lastName: z.string().trim().min(1).max(100),
+function normalize(value: string | null) {
+  return value?.trim() || null;
+}
 
-      birthDate: z.iso.date(),
-    }),
-  ]
-);
+function normalizeDate(value: string | null) {
+  const date = normalize(value);
 
-// =====================================================
-// IMAGE VALIDATION
-// =====================================================
-
-async function validateImage(
-  buffer: Buffer
-): Promise<"image/png" | "image/jpeg"> {
-  const image = sharp(buffer, {
-    limitInputPixels: 20_000_000,
-  });
-
-  const metadata = await image.metadata();
-
-  if (
-    metadata.format !== "png" &&
-    metadata.format !== "jpeg"
-  ) {
-    throw new Error("INVALID_IMAGE_FORMAT");
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return null;
   }
 
-  // Forces Sharp to decode the image.
-  await image.stats();
+  const parsed = new Date(`${date}T00:00:00Z`);
 
-  return metadata.format === "png"
-    ? "image/png"
-    : "image/jpeg";
+  return !Number.isNaN(parsed.getTime()) &&
+    parsed.toISOString().slice(0, 10) === date
+    ? date
+    : null;
+}
+
+function normalizeExtraction(
+  raw: z.infer<typeof extractionSchema>
+) {
+  const pinCandidate = normalize(raw.pin)?.replace(
+    /[\s-]/g,
+    ""
+  );
+
+  const pin =
+    pinCandidate && /^\d{12}$/.test(pinCandidate)
+      ? pinCandidate
+      : null;
+
+  const transactionCandidate = normalize(
+    raw.transactionNumber
+  )
+    ?.toUpperCase()
+    .replace(/[\s-]/g, "");
+
+  const transactionNumber =
+    transactionCandidate &&
+    /^[A-Z0-9]{8,32}$/.test(transactionCandidate)
+      ? transactionCandidate
+      : null;
+
+  const bounded = (value: string | null, limit: number) => {
+    const text = normalize(value);
+    return text && text.length <= limit ? text : null;
+  };
+
+  return {
+    transactionNumber,
+    pin,
+    firstName: bounded(raw.firstName, 100),
+    middleName: bounded(raw.middleName, 100),
+    lastName: bounded(raw.lastName, 100),
+    birthDate: normalizeDate(raw.birthDate),
+    errorCode: bounded(raw.errorCode, 100),
+    assignedClinic: bounded(raw.assignedClinic, 500),
+  };
 }
 
 // =====================================================
-// POST /api/submissions
+// POST /api/internal/worker/result
 // =====================================================
 
 export async function POST(request: Request) {
-  let screenshotKey: string | null = null;
+  console.info("PCU_WORKER_RESULT_REQUEST_RECEIVED");
 
-  let persisted = false;
+  if (!isAuthorizedWorker(request)) {
+    return NextResponse.json(
+      { error: "Unauthorized" },
+      { status: 401 }
+    );
+  }
 
-  let currentStep = "INITIALIZING";
+  const parsed = payloadSchema.safeParse(
+    await request.json().catch(() => null)
+  );
 
-  let savedReference: string | null = null;
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid worker result." },
+      { status: 400 }
+    );
+  }
+
+  const payload = parsed.data;
+
+  const conditions = and(
+    eq(pcuSubmissions.id, payload.submissionId),
+    eq(pcuSubmissions.aiStatus, "PROCESSING"),
+    eq(pcuSubmissions.aiLeaseToken, payload.leaseToken),
+    gt(pcuSubmissions.aiLeaseExpiresAt, new Date()),
+    eq(pcuSubmissions.submittedOutcome, "SUCCESS"),
+    eq(pcuSubmissions.verificationStatus, "PENDING")
+  );
 
   try {
-    // -------------------------------------------------
-    // 1. VALIDATE FORM
-    // -------------------------------------------------
+    // =================================================
+    // FAILED EXTRACTION
+    // =================================================
 
-    currentStep = "VALIDATING_FORM";
+    if (payload.status === "FAILED") {
+      // The UPDATE is conditional on the lease.
+      const [updated] = await db
+        .update(pcuSubmissions)
+        .set({
+          aiStatus: "PENDING",
+          aiLeaseToken: null,
+          aiLeaseExpiresAt: null,
+          aiLastError: payload.errorCode,
+          updatedAt: new Date(),
+        })
+        .where(conditions)
+        .returning({
+          id: pcuSubmissions.id,
+          attempts: pcuSubmissions.aiAttempts,
+        });
 
-    const form = await request.formData();
+      if (!updated) {
+        return NextResponse.json(
+          { error: "Job lease invalid or expired." },
+          { status: 409 }
+        );
+      }
 
-    const parsed = submissionSchema.safeParse({
-      outcome: form.get("outcome"),
-      barangay: form.get("barangay"),
-      firstName: form.get("firstName"),
-      middleName: form.get("middleName") ?? "",
-      lastName: form.get("lastName"),
-      birthDate: form.get("birthDate"),
-    });
+      if (updated.attempts >= MAX_ATTEMPTS) {
+        await db
+          .update(pcuSubmissions)
+          .set({
+            aiStatus: "FAILED",
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(pcuSubmissions.id, updated.id),
+              eq(pcuSubmissions.aiStatus, "PENDING")
+            )
+          );
+      }
 
-    if (!parsed.success) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "Invalid submission information.",
-        },
-        { status: 400 }
-      );
+      return NextResponse.json({
+        success: true,
+        retryAllowed: updated.attempts < MAX_ATTEMPTS,
+      });
     }
 
-    // -------------------------------------------------
-    // 2. VALIDATE SCREENSHOT
-    // -------------------------------------------------
+    // =================================================
+    // SUCCESSFUL EXTRACTION
+    // =================================================
 
-    currentStep = "VALIDATING_SCREENSHOT";
-
-    const file = form.get("screenshot");
-
-    if (
-      !(file instanceof File) ||
-      file.size === 0 ||
-      file.size > MAX_SIZE
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          error: "A screenshot under 5 MB is required.",
-        },
-        { status: 400 }
-      );
-    }
-
-    const buffer = Buffer.from(
-      await file.arrayBuffer()
+    const extracted = normalizeExtraction(
+      payload.extraction
     );
 
-    let contentType: "image/png" | "image/jpeg";
-
-    try {
-      contentType = await validateImage(buffer);
-    } catch {
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "Please upload a valid PNG or JPEG screenshot.",
-        },
-        { status: 400 }
-      );
-    }
-
-    // -------------------------------------------------
-    // 3. DETERMINE SUBMISSION TYPE
-    // -------------------------------------------------
-
-    currentStep = "PREPARING_SUBMISSION";
-
-    const failed =
-      parsed.data.outcome === "FAILED";
-
-    // FAILED submissions use the manually entered
-    // information. No AI extraction is necessary.
-    //
-    // SUCCESS submissions are queued for the
-    // private MacBook AI worker.
-
-
-let patientFields: {
-  firstName: string | null;
-  middleName: string | null;
-  lastName: string | null;
-  birthDate: string | null;
-};
-
-if (parsed.data.outcome === "FAILED") {
-  // TypeScript narrows parsed.data to the FAILED
-  // branch, where these fields exist.
-  patientFields = {
-    firstName: parsed.data.firstName,
-    middleName: parsed.data.middleName || null,
-    lastName: parsed.data.lastName,
-    birthDate: parsed.data.birthDate,
-  };
-} else {
-  // SUCCESS submissions wait for AI extraction.
-  patientFields = {
-    firstName: null,
-    middleName: null,
-    lastName: null,
-    birthDate: null,
-  };
-}
-
-
-    const aiStatus = failed
-      ? ("SKIPPED" as const)
-      : ("PENDING" as const);
-
-    const classification = failed
-      ? ("FAILED" as const)
-      : ("MANUAL_REVIEW" as const);
-
-    // -------------------------------------------------
-    // 4. SAVE SCREENSHOT
-    // -------------------------------------------------
-
-    currentStep = "STORAGE_UPLOAD";
-
-    screenshotKey = await saveScreenshot(
-      buffer,
-      contentType
+    const classification = classifyPCU(
+      "SUCCESS",
+      extracted
     );
 
-    // -------------------------------------------------
-    // 5. SAVE SUBMISSION TO NEON
-    // -------------------------------------------------
-
-    currentStep = "DATABASE_INSERT";
+    // Accept results only from the active lease.
+    // RHU-reviewed records cannot be overwritten.
 
     const [saved] = await db
-      .insert(pcuSubmissions)
-      .values({
-        barangay: parsed.data.barangay,
+      .update(pcuSubmissions)
+      .set({
+        transactionNumber: extracted.transactionNumber,
+        extractedPin: extracted.pin,
+        firstName: extracted.firstName,
+        middleName: extracted.middleName,
+        lastName: extracted.lastName,
+        birthDate: extracted.birthDate,
+        assignedClinic: extracted.assignedClinic,
+        errorCode: extracted.errorCode,
 
-        submittedOutcome: parsed.data.outcome,
-
-        // Patient information
-        ...patientFields,
-
-        // AI fields remain empty until the
-        // worker returns a validated extraction.
-        transactionNumber: null,
-
-        extractedPin: null,
-
-        assignedClinic: null,
-
-        errorCode: null,
-
-        ocrRawText: null,
-
-        // Private screenshot
-        screenshotKey,
-
-        // Provisional classification
         classification,
 
-        // RHU verification is always separate
-        // from AI extraction.
-        verificationStatus: "PENDING",
+        aiStatus: "COMPLETED",
+        aiProcessedAt: new Date(),
+        aiLeaseToken: null,
+        aiLeaseExpiresAt: null,
+        aiLastError: null,
 
         sheetSyncStatus: "PENDING",
-
-        // -----------------------------------------
-        // PRIVATE AI WORKER QUEUE
-        // -----------------------------------------
-
-        aiStatus,
-
-        aiAttempts: 0,
-
-        aiLeaseToken: null,
-
-        aiLeaseExpiresAt: null,
-
-        aiProcessedAt: null,
-
-        aiLastError: null,
+        updatedAt: new Date(),
       })
+      .where(conditions)
       .returning();
 
     if (!saved) {
-      throw new Error(
-        "DATABASE_INSERT_RETURNED_NO_RECORD"
+      return NextResponse.json(
+        {
+          error:
+            "Job lease invalid, expired, or already reviewed.",
+        },
+        { status: 409 }
       );
     }
 
-    persisted = true;
-
-    savedReference = saved.id;
-
-    console.info("PCU_SUBMISSION_SAVED", {
+    console.info("PCU_WORKER_EXTRACTION_SAVED", {
       reference: saved.id,
-      submittedOutcome: saved.submittedOutcome,
-      aiStatus,
+      classification: saved.classification,
     });
 
-    // -------------------------------------------------
-    // 6. GOOGLE SHEETS SYNCHRONIZATION
-    // -------------------------------------------------
-
-    // For SUCCESS:
-    //
-    // Do not sync incomplete extracted information.
-    // The worker result endpoint will synchronize
-    // after AI extraction has completed.
-    //
-    // For FAILED:
-    //
-    // Preserve the original behavior of immediately
-    // sending manually entered information to Sheets.
+    // =================================================
+    // GOOGLE SHEETS SYNCHRONIZATION
+    // =================================================
 
     let sheetsWritten = false;
-
-    let syncStatusRecorded = false;
-
     let targetSheet: string | null = null;
 
-    if (failed) {
-      currentStep = "GOOGLE_SHEETS_SYNC";
-
+    try {
       const fullName = [
         saved.firstName,
         saved.middleName,
@@ -327,152 +272,61 @@ if (parsed.data.outcome === "FAILED") {
         .filter(Boolean)
         .join(" ");
 
-      try {
-        const result =
-          await syncSubmissionToSheets({
-            id: saved.id,
+      const result = await syncSubmissionToSheets({
+        id: saved.id,
+        submittedAt: saved.submittedAt,
+        barangay: saved.barangay,
+        outcome: saved.submittedOutcome,
+        classification: saved.classification,
+        transactionNumber: saved.transactionNumber,
+        fullName,
+        birthDate: saved.birthDate,
+        pin: saved.extractedPin,
+        assignedClinic: saved.assignedClinic,
+        errorCode: saved.errorCode,
+        verificationStatus: saved.verificationStatus,
+      });
 
-            submittedAt: saved.submittedAt,
-
-            barangay: saved.barangay,
-
-            outcome: saved.submittedOutcome,
-
-            classification: saved.classification,
-
-            transactionNumber:
-              saved.transactionNumber,
-
-            fullName,
-
-            birthDate: saved.birthDate,
-
-            pin: saved.extractedPin,
-
-            assignedClinic: saved.assignedClinic,
-
-            errorCode: saved.errorCode,
-
-            verificationStatus:
-              saved.verificationStatus,
-          });
-
-        sheetsWritten = result.success;
-
-        targetSheet = result.targetSheet;
-
-        console.info("PCU_SYNC_RESULT", {
-          reference: saved.id,
-          targetSheet,
-          success: sheetsWritten,
-        });
-      } catch (error: unknown) {
-        const code =
-          typeof error === "object" &&
-          error !== null &&
-          "code" in error
-            ? String(error.code)
-            : "UNKNOWN";
-
-        console.error(
-          "PCU Google Sheets synchronization failed",
-          { code }
-        );
-      }
-
-      // -------------------------------------------
-      // UPDATE DATABASE SHEET SYNC STATUS
-      // -------------------------------------------
+      sheetsWritten = result.success;
+      targetSheet = result.targetSheet;
 
       if (sheetsWritten) {
-        currentStep = "UPDATING_SYNC_STATUS";
-
-        try {
-          await db
-            .update(pcuSubmissions)
-            .set({
-              sheetSyncStatus: "SYNCED",
-              updatedAt: new Date(),
-            })
-            .where(
-              eq(pcuSubmissions.id, saved.id)
-            );
-
-          syncStatusRecorded = true;
-        } catch {
-          console.error(
-            "Sheets succeeded but database sync " +
-              "status update failed"
-          );
-        }
+        await db
+          .update(pcuSubmissions)
+          .set({
+            sheetSyncStatus: "SYNCED",
+            updatedAt: new Date(),
+          })
+          .where(eq(pcuSubmissions.id, saved.id));
       }
+    } catch (error) {
+      console.error("PCU_WORKER_SHEETS_SYNC_FAILED", {
+        errorType:
+          error instanceof Error
+            ? error.name
+            : "UNKNOWN",
+      });
     }
 
-    // -------------------------------------------------
-    // 7. RETURN SUCCESSFUL SUBMISSION RESPONSE
-    // -------------------------------------------------
+    // =================================================
+    // RESPONSE
+    // =================================================
 
-    currentStep = "RETURNING_RESPONSE";
-
-    return NextResponse.json(
-      {
-        success: true,
-
-        message: failed
-          ? "PCU failed transaction saved successfully. " +
-            "RHU verification is required."
-          : "PCU screenshot received successfully. " +
-            "AI extraction is queued for processing.",
-
-        reference: saved.id,
-
-        classification: saved.classification,
-
-        verificationStatus:
-          saved.verificationStatus,
-
-        targetSheet:
-          sheetsWritten
-            ? targetSheet
-            : null,
-
-        sheetSyncStatus:
-          syncStatusRecorded
-            ? "SYNCED"
-            : "PENDING",
-
-        requiresReview: true,
-
-        // -----------------------------------------
-        // AI PROCESSING STATUS
-        // -----------------------------------------
-
-        aiStatus,
-
-        ocrStatus: failed
-          ? "SKIPPED"
-          : "PENDING",
-
-        ocrWarnings: [],
-
-        // Let the frontend distinguish
-        // a stored screenshot from an
-        // already completed extraction.
-        extractionPending: !failed,
-      },
-      { status: 201 }
-    );
+    return NextResponse.json({
+      success: true,
+      reference: saved.id,
+      aiStatus: "COMPLETED",
+      classification,
+      verificationStatus: saved.verificationStatus,
+      sheetSyncStatus: sheetsWritten
+        ? "SYNCED"
+        : "PENDING",
+      targetSheet: sheetsWritten ? targetSheet : null,
+      requiresReview: true,
+    });
   } catch (error: unknown) {
-    // -------------------------------------------------
-    // 8. SAFE ERROR HANDLING
-    // -------------------------------------------------
-
-    const traceId = randomUUID();
-
     const cause =
-      error instanceof Error
-        ? error.cause
-        : undefined;
+      error instanceof Error ? error.cause : undefined;
 
     const dbError = cause as
       | {
@@ -482,55 +336,20 @@ if (parsed.data.outcome === "FAILED") {
         }
       | undefined;
 
-    console.error("PCU submission failed:", {
-      traceId,
-
-      reference: savedReference,
-
-      step: currentStep,
-
-      errorType:
+    console.error("PCU_WORKER_RESULT_FAILED", {
+      name:
         error instanceof Error
           ? error.name
           : "UNKNOWN",
-
-      code: dbError?.code ?? "UNKNOWN",
-
-      column: dbError?.column,
-
-      constraint: dbError?.constraint,
+      postgresCode: dbError?.code ?? null,
+      column: dbError?.column ?? null,
+      constraint: dbError?.constraint ?? null,
     });
-
-    // Remove the screenshot only when the
-    // submission was never persisted.
-    //
-    // Never delete images belonging to
-    // successfully saved Neon records.
-
-    if (!persisted && screenshotKey) {
-      await deleteScreenshot(
-        screenshotKey
-      ).catch(() => {
-        console.error(
-          "Screenshot cleanup failed",
-          { traceId }
-        );
-      });
-    }
 
     return NextResponse.json(
       {
         success: false,
-
-        error:
-          "PCU submission could not be completed.",
-
-        reference: traceId,
-
-        step:
-          process.env.NODE_ENV === "development"
-            ? currentStep
-            : undefined,
+        error: "Worker result processing failed.",
       },
       { status: 500 }
     );
