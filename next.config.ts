@@ -1,12 +1,20 @@
+
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  allowedDevOrigins: [
+    "robert-likes-caring-hon.trycloudflare.com",
+  ],
+
+  serverExternalPackages: ["tesseract.js"],
+
   experimental: {
     agentFeedback: true,
   },
+
   cacheComponents: true,
   partialPrefetching: true,
+
   turbopack: {
     rules: {
       "*.css": {
