@@ -1,5 +1,6 @@
 
 import { NextResponse } from "next/server";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import sharp from "sharp";
 import { eq } from "drizzle-orm";
@@ -7,11 +8,6 @@ import { eq } from "drizzle-orm";
 import { db } from "@/app/db";
 import { pcuSubmissions } from "@/app/db/schema";
 import { BARANGAYS } from "@/app/lib/barangays";
-
-import {
-  extractPCUData,
-  type ExtractedPCU,
-} from "@/app/lib/ocr";
 
 import {
   saveScreenshot,
@@ -27,9 +23,6 @@ import {
 // =====================================================
 
 const MAX_SIZE = 5 * 1024 * 1024;
-
-type Classification =
-  typeof pcuSubmissions.$inferInsert["classification"];
 
 // =====================================================
 // FORM VALIDATION
@@ -75,144 +68,12 @@ async function validateImage(
     throw new Error("INVALID_IMAGE_FORMAT");
   }
 
+  // Decode the image to verify that it is valid.
   await image.stats();
 
   return metadata.format === "png"
     ? "image/png"
     : "image/jpeg";
-}
-
-// =====================================================
-// EXTRACTION HELPERS
-// =====================================================
-
-function emptyExtraction(): ExtractedPCU {
-  return {
-    rawText: "",
-    transactionNumber: null,
-    pin: null,
-    firstName: null,
-    middleName: null,
-    lastName: null,
-    birthDate: null,
-    errorCode: null,
-    assignedClinic: null,
-    warnings: [],
-  };
-}
-
-function normalize(value: string | null | undefined) {
-  return String(value ?? "").trim();
-}
-
-function validPin(value: string | null | undefined) {
-  return /^\d{12}$/.test(
-    normalize(value).replace(/[\s-]/g, "")
-  );
-}
-
-function validDate(value: string | null | undefined) {
-  const date = normalize(value);
-
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return false;
-  }
-
-  const parsed = new Date(`${date}T00:00:00Z`);
-
-  return (
-    !Number.isNaN(parsed.getTime()) &&
-    parsed.toISOString().slice(0, 10) === date
-  );
-}
-
-function hasCompleteDetails(
-  extracted: ExtractedPCU
-) {
-  return (
-    validPin(extracted.pin) &&
-    normalize(extracted.firstName).length > 0 &&
-    normalize(extracted.lastName).length > 0 &&
-    validDate(extracted.birthDate) &&
-    normalize(extracted.transactionNumber).length > 0
-  );
-}
-
-// =====================================================
-// CLINIC VALIDATION
-// =====================================================
-
-function isNotAssigned(
-  clinicValue: string | null | undefined
-) {
-  const clinic = normalize(clinicValue);
-
-  // Blank clinic is NOT equivalent to Not Assigned.
-  return /^(?:not\s*(?:yet\s*)?assigned|unassigned|no\s*(?:assigned\s*)?(?:clinic|facility))(?:[.!])?$/i
-    .test(clinic);
-}
-
-function isSebasteClinic(
-  clinicValue: string | null | undefined
-) {
-  const clinic = normalize(clinicValue);
-
-  if (!clinic) {
-    return false;
-  }
-
-  if (
-    /\b(?:not assigned|unassigned|not registered)\b/i
-      .test(clinic)
-  ) {
-    return false;
-  }
-
-  const sebaste = /\bsebaste\b/i.test(clinic);
-
-  const facility =
-    /\b(?:yakap|clinic|rhu|rural health unit|health center)\b/i
-      .test(clinic);
-
-  return sebaste && facility;
-}
-
-// =====================================================
-// CLASSIFICATION
-// =====================================================
-
-function classifySubmission(
-  outcome: "SUCCESS" | "FAILED",
-  extracted: ExtractedPCU
-): Classification {
-  // Submitted failed transactions go to FAILED.
-  if (outcome === "FAILED") {
-    return "FAILED";
-  }
-
-  // Never classify incomplete successful screenshots
-  // as confirmed facility assignments.
-  if (!hasCompleteDetails(extracted)) {
-    return "MANUAL_REVIEW";
-  }
-
-  const clinic = normalize(extracted.assignedClinic);
-
-  if (isNotAssigned(clinic)) {
-    return "SUCCESS_NOT_ASSIGNED";
-  }
-
-  if (isSebasteClinic(clinic)) {
-    return "SUCCESS_SEBASTE";
-  }
-
-  if (!clinic) {
-    return "SUCCESS_NO_CLINIC";
-  }
-
-  // An identified facility that isn't Sebaste
-  // must not appear in PCU_SUCCESS.
-  return "SUCCESS_OTHER_CLINIC";
 }
 
 // =====================================================
@@ -223,6 +84,7 @@ export async function POST(request: Request) {
   let screenshotKey: string | null = null;
   let persisted = false;
   let currentStep = "INITIALIZING";
+  let savedReference: string | null = null;
 
   try {
     // -------------------------------------------------
@@ -294,109 +156,56 @@ export async function POST(request: Request) {
     }
 
     // -------------------------------------------------
-    // 3. AI EXTRACTION
+    // 3. PREPARE SUBMISSION
     // -------------------------------------------------
 
-    currentStep = "AI_EXTRACTION";
+    currentStep = "PREPARING_SUBMISSION";
 
-    let extracted = emptyExtraction();
+    const failed = parsed.data.outcome === "FAILED";
 
-    try {
-      extracted = await extractPCUData(buffer);
-    } catch (error: unknown) {
-      const err = error as {
-        message?: string;
-        code?: string | number;
-        status?: number;
+    // Explicit discriminated-union narrowing
+    // prevents TypeScript TS2339 errors.
+    let patientFields: {
+      firstName: string | null;
+      middleName: string | null;
+      lastName: string | null;
+      birthDate: string | null;
+    };
+
+    if (parsed.data.outcome === "FAILED") {
+      // Failed registrations already have manually
+      // entered patient information.
+      patientFields = {
+        firstName: parsed.data.firstName,
+        middleName: parsed.data.middleName || null,
+        lastName: parsed.data.lastName,
+        birthDate: parsed.data.birthDate,
       };
-
-      const knownErrors = new Set([
-        "GEMINI_API_KEY_NOT_CONFIGURED",
-        "EXTERNAL_AI_PROCESSING_NOT_APPROVED",
-        "UNKNOWN_PCU_AI_PROVIDER",
-        "LOCAL_VLM_NOT_CONFIGURED",
-        "GEMINI_EMPTY_RESPONSE",
-        "GEMINI_INVALID_JSON",
-        "GEMINI_INVALID_SCHEMA",
-      ]);
-
-      const errorCode =
-        err.message && knownErrors.has(err.message)
-          ? err.message
-          : "AI_PROVIDER_REQUEST_FAILED";
-
-      console.error("PCU AI ERROR:", {
-        errorCode,
-        status: err.status ?? null,
-        code: err.code ?? null,
-      });
-
-      return NextResponse.json(
-        {
-          success: false,
-          error:
-            "AI extraction is currently unavailable.",
-          ...(process.env.NODE_ENV === "development"
-            ? { errorCode }
-            : {}),
-        },
-        { status: 503 }
-      );
+    } else {
+      // Successful registrations will receive
+      // extracted details from the MacBook worker.
+      patientFields = {
+        firstName: null,
+        middleName: null,
+        lastName: null,
+        birthDate: null,
+      };
     }
 
-    // -------------------------------------------------
-    // 4. CLASSIFY EXTRACTION
-    // -------------------------------------------------
+    // Failed transactions do not require OCR.
+    // Successful transactions enter the AI queue.
+    const aiStatus = failed
+      ? ("SKIPPED" as const)
+      : ("PENDING" as const);
 
-    currentStep = "CLASSIFICATION";
-
-    const classification = classifySubmission(
-      parsed.data.outcome,
-      extracted
-    );
-
-    // IMPORTANT:
-    // Classification is provisional.
-    // Registration verification remains PENDING.
+    // Classification remains provisional
+    // until processing and/or RHU review.
+    const classification = failed
+      ? ("FAILED" as const)
+      : ("MANUAL_REVIEW" as const);
 
     // -------------------------------------------------
-    // 5. PREPARE PATIENT DATA
-    // -------------------------------------------------
-
-    currentStep = "PREPARING_PATIENT_DATA";
-
-   
-const failed = parsed.data.outcome === "FAILED";
-
-let patientFields: {
-  firstName: string | null;
-  middleName: string | null;
-  lastName: string | null;
-  birthDate: string | null;
-};
-
-if (parsed.data.outcome === "FAILED") {
-  // TypeScript now knows this is the FAILED
-  // branch of the discriminated union.
-  patientFields = {
-    firstName: parsed.data.firstName,
-    middleName: parsed.data.middleName || null,
-    lastName: parsed.data.lastName,
-    birthDate: parsed.data.birthDate,
-  };
-} else {
-  // Successful transactions use AI extraction.
-  patientFields = {
-    firstName: extracted.firstName,
-    middleName: extracted.middleName,
-    lastName: extracted.lastName,
-    birthDate: extracted.birthDate,
-  };
-}
-
-
-    // -------------------------------------------------
-    // 6. SAVE SCREENSHOT
+    // 4. SAVE SCREENSHOT
     // -------------------------------------------------
 
     currentStep = "STORAGE_UPLOAD";
@@ -407,7 +216,7 @@ if (parsed.data.outcome === "FAILED") {
     );
 
     // -------------------------------------------------
-    // 7. SAVE RECORD TO NEON
+    // 5. SAVE TO NEON
     // -------------------------------------------------
 
     currentStep = "DATABASE_INSERT";
@@ -421,30 +230,31 @@ if (parsed.data.outcome === "FAILED") {
 
         ...patientFields,
 
-        transactionNumber: extracted.transactionNumber,
-
-        // Failed transactions have no valid PIN
-        // or clinic assignment.
-        extractedPin: failed
-          ? null
-          : extracted.pin,
-
-        assignedClinic: failed
-          ? null
-          : extracted.assignedClinic,
-
-        errorCode: extracted.errorCode,
+        transactionNumber: null,
+        extractedPin: null,
+        verifiedPin: null,
+        assignedClinic: null,
+        errorCode: null,
+        ocrRawText: null,
 
         screenshotKey,
 
-        ocrRawText: extracted.rawText,
-
         classification,
 
-        // AI classification is never RHU approval.
         verificationStatus: "PENDING",
 
         sheetSyncStatus: "PENDING",
+
+        // -----------------------------------------
+        // PRIVATE AI WORKER QUEUE
+        // -----------------------------------------
+
+        aiStatus,
+        aiAttempts: 0,
+        aiLeaseToken: null,
+        aiLeaseExpiresAt: null,
+        aiProcessedAt: null,
+        aiLastError: null,
       })
       .returning();
 
@@ -455,137 +265,155 @@ if (parsed.data.outcome === "FAILED") {
     }
 
     persisted = true;
+    savedReference = saved.id;
+
+    console.info("PCU_SUBMISSION_SAVED", {
+      reference: saved.id,
+      outcome: saved.submittedOutcome,
+      aiStatus,
+    });
 
     // -------------------------------------------------
-    // 8. BUILD GOOGLE SHEETS DATA
+    // 6. GOOGLE SHEETS SYNCHRONIZATION
     // -------------------------------------------------
 
-    currentStep = "PREPARING_SHEET_DATA";
-
-    const fullName = [
-      saved.firstName,
-      saved.middleName,
-      saved.lastName,
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    // -------------------------------------------------
-    // 9. IMMEDIATE GOOGLE SHEETS SYNC
-    // -------------------------------------------------
-
-    currentStep = "GOOGLE_SHEETS_SYNC";
+    // SUCCESS submissions:
+    // Wait until the worker returns AI results.
+    //
+    // FAILED submissions:
+    // Preserve immediate Google Sheets sync
+    // using manually entered patient information.
 
     let sheetsWritten = false;
     let syncStatusRecorded = false;
-
     let targetSheet: string | null = null;
 
-    try {
-      const result = await syncSubmissionToSheets({
-        id: saved.id,
-        submittedAt: saved.submittedAt,
-        barangay: saved.barangay,
-        outcome: saved.submittedOutcome,
-        classification: saved.classification,
-        transactionNumber: saved.transactionNumber,
-        fullName,
-        birthDate: saved.birthDate,
-        pin: saved.extractedPin,
-        assignedClinic: saved.assignedClinic,
-        errorCode: saved.errorCode,
-        verificationStatus: saved.verificationStatus,
-      });
+    if (failed) {
+      currentStep = "GOOGLE_SHEETS_SYNC";
 
-      sheetsWritten = result.success;
-
-      targetSheet = result.targetSheet;
-
-      console.info("PCU_SYNC_RESULT", {
-        targetSheet,
-        success: sheetsWritten,
-      });
-    } catch (error: unknown) {
-      const code =
-        typeof error === "object" &&
-        error !== null &&
-        "code" in error
-          ? String(error.code)
-          : "UNKNOWN";
-
-      console.error(
-        "PCU Google Sheets synchronization failed",
-        { code }
-      );
-    }
-
-    // -------------------------------------------------
-    // 10. UPDATE DATABASE SYNC STATUS
-    // -------------------------------------------------
-
-    if (sheetsWritten) {
-      currentStep = "UPDATING_SYNC_STATUS";
+      const fullName = [
+        saved.firstName,
+        saved.middleName,
+        saved.lastName,
+      ]
+        .filter(Boolean)
+        .join(" ");
 
       try {
-        await db
-          .update(pcuSubmissions)
-          .set({
-            sheetSyncStatus: "SYNCED",
-            updatedAt: new Date(),
-          })
-          .where(
-            eq(pcuSubmissions.id, saved.id)
-          );
+        const result = await syncSubmissionToSheets({
+          id: saved.id,
+          submittedAt: saved.submittedAt,
+          barangay: saved.barangay,
+          outcome: saved.submittedOutcome,
+          classification: saved.classification,
+          transactionNumber: saved.transactionNumber,
+          fullName,
+          birthDate: saved.birthDate,
+          pin: saved.extractedPin,
+          assignedClinic: saved.assignedClinic,
+          errorCode: saved.errorCode,
+          verificationStatus: saved.verificationStatus,
+        });
 
-        syncStatusRecorded = true;
-      } catch {
+        sheetsWritten = result.success;
+        targetSheet = result.targetSheet;
+
+        console.info("PCU_SYNC_RESULT", {
+          reference: saved.id,
+          targetSheet,
+          success: sheetsWritten,
+        });
+      } catch (error: unknown) {
+        const code =
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error
+            ? String(error.code)
+            : "UNKNOWN";
+
         console.error(
-          "Sheets succeeded but database sync " +
-          "status update failed"
+          "PCU_GOOGLE_SHEETS_SYNC_FAILED",
+          { code }
         );
+      }
+
+      // -------------------------------------------------
+      // 7. UPDATE SHEETS SYNC STATUS
+      // -------------------------------------------------
+
+      if (sheetsWritten) {
+        currentStep = "UPDATING_SYNC_STATUS";
+
+        try {
+          await db
+            .update(pcuSubmissions)
+            .set({
+              sheetSyncStatus: "SYNCED",
+              updatedAt: new Date(),
+            })
+            .where(
+              eq(pcuSubmissions.id, saved.id)
+            );
+
+          syncStatusRecorded = true;
+        } catch {
+          console.error(
+            "SHEETS_SYNC_STATUS_UPDATE_FAILED",
+            { reference: saved.id }
+          );
+        }
       }
     }
 
     // -------------------------------------------------
-    // 11. RETURN RESPONSE
+    // 8. RETURN RESPONSE
     // -------------------------------------------------
 
     return NextResponse.json(
       {
         success: true,
 
-        message:
-          "PCU transaction saved successfully. " +
-          "RHU verification is required.",
+        message: failed
+          ? "PCU failed transaction saved successfully. " +
+            "RHU verification is required."
+          : "PCU screenshot received successfully. " +
+            "AI extraction is queued for processing.",
 
         reference: saved.id,
 
         classification: saved.classification,
 
-        verificationStatus: saved.verificationStatus,
+        verificationStatus:
+          saved.verificationStatus,
 
-        targetSheet:
-          sheetsWritten
-            ? targetSheet
-            : null,
+        targetSheet: sheetsWritten
+          ? targetSheet
+          : null,
 
-        sheetSyncStatus:
-          syncStatusRecorded
-            ? "SYNCED"
-            : "PENDING",
+        sheetSyncStatus: syncStatusRecorded
+          ? "SYNCED"
+          : "PENDING",
 
         requiresReview: true,
 
-        ocrStatus: "EXTRACTED",
+        aiStatus,
 
-        ocrWarnings: extracted.warnings,
+        ocrStatus: failed
+          ? "SKIPPED"
+          : "PENDING",
+
+        ocrWarnings: [],
+
+        extractionPending: !failed,
       },
       { status: 201 }
     );
   } catch (error: unknown) {
     // -------------------------------------------------
-    // SAFE ERROR HANDLING
+    // 9. ERROR HANDLING
     // -------------------------------------------------
+
+    const traceId = randomUUID();
 
     const cause =
       error instanceof Error
@@ -600,22 +428,26 @@ if (parsed.data.outcome === "FAILED") {
         }
       | undefined;
 
-    console.error("PCU submission failed:", {
+    console.error("PCU_SUBMISSION_FAILED", {
+      traceId,
+      reference: savedReference,
       step: currentStep,
-      code: dbError?.code ?? "UNKNOWN",
-      column: dbError?.column,
-      constraint: dbError?.constraint,
+      errorType:
+        error instanceof Error
+          ? error.name
+          : "UNKNOWN",
+      databaseCode: dbError?.code ?? null,
+      column: dbError?.column ?? null,
+      constraint: dbError?.constraint ?? null,
     });
 
-    // Remove orphaned screenshots only if
-    // the Neon record was not saved.
+    // Delete an orphaned screenshot only if
+    // the database record was not persisted.
     if (!persisted && screenshotKey) {
-      await deleteScreenshot(
-        screenshotKey
-      ).catch(() => {
-        console.error(
-          "Screenshot cleanup failed"
-        );
+      await deleteScreenshot(screenshotKey).catch(() => {
+        console.error("SCREENSHOT_CLEANUP_FAILED", {
+          traceId,
+        });
       });
     }
 
@@ -625,6 +457,8 @@ if (parsed.data.outcome === "FAILED") {
 
         error:
           "PCU submission could not be completed.",
+
+        reference: traceId,
 
         step:
           process.env.NODE_ENV === "development"
