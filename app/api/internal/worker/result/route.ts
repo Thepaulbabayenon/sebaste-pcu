@@ -329,34 +329,38 @@ export async function POST(request: Request) {
       targetSheet: sheetsWritten ? targetSheet : null,
       requiresReview: true,
     });
-  } catch (error: unknown) {
-    const cause =
-      error instanceof Error ? error.cause : undefined;
+ 
+} catch (error: unknown) {
+  const err = error as {
+    name?: string;
+    message?: string;
+    code?: string | number;
+    status?: number;
+    response?: {
+      status?: number;
+    };
+  };
 
-    const dbError = cause as
-      | {
-          code?: string;
-          column?: string;
-          constraint?: string;
-        }
-      | undefined;
-
-    console.error("PCU_WORKER_RESULT_FAILED", {
-      name:
-        error instanceof Error
-          ? error.name
-          : "UNKNOWN",
-      postgresCode: dbError?.code ?? null,
-      column: dbError?.column ?? null,
-      constraint: dbError?.constraint ?? null,
-    });
-
-    return NextResponse.json(
-      {
-        success: false,
-        error: "Worker result processing failed.",
-      },
-      { status: 500 }
-    );
-  }
+  // Log only predefined diagnostic fields.
+  // Do not log raw error objects or messages:
+  // they could contain sensitive request data.
+  console.error("PCU_WORKER_SHEETS_SYNC_FAILED", {
+    errorType: err.name ?? "UNKNOWN",
+    code: err.code ?? null,
+    httpStatus:
+      err.response?.status ??
+      err.status ??
+      null,
+    messageCategory:
+      typeof err.message === "string"
+        ? err.message.includes("GOOGLE")
+          ? "GOOGLE_CONFIGURATION"
+          : err.message.includes("SPREADSHEET")
+            ? "SPREADSHEET_CONFIGURATION"
+            : err.message.includes("credential")
+              ? "CREDENTIAL_CONFIGURATION"
+              : "UNCLASSIFIED"
+        : "UNKNOWN",
+  });
+}
 }
