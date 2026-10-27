@@ -23,10 +23,12 @@ const MAX_ATTEMPTS = 3;
 const extractionSchema = z.object({
   transactionNumber: z.string().nullable(),
   pin: z.string().nullable(),
+
   firstName: z.string().nullable(),
   middleName: z.string().nullable(),
   lastName: z.string().nullable(),
   birthDate: z.string().nullable(),
+
   errorCode: z.string().nullable(),
   assignedClinic: z.string().nullable(),
 });
@@ -38,10 +40,12 @@ const payloadSchema = z.discriminatedUnion("status", [
     leaseToken: z.string().uuid(),
     extraction: extractionSchema,
   }),
+
   z.object({
     status: z.literal("FAILED"),
     submissionId: z.string().uuid(),
     leaseToken: z.string().uuid(),
+
     errorCode: z.enum([
       "OLLAMA_UNAVAILABLE",
       "OLLAMA_TIMEOUT",
@@ -52,21 +56,37 @@ const payloadSchema = z.discriminatedUnion("status", [
   }),
 ]);
 
-function normalize(value: string | null) {
+// =====================================================
+// HELPERS
+// =====================================================
+
+function normalize(
+  value: string | null
+): string | null {
   return value?.trim() || null;
 }
 
-function normalizeDate(value: string | null) {
+function normalizeDate(
+  value: string | null
+): string | null {
   const date = normalize(value);
 
-  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+  if (
+    !date ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(date)
+  ) {
     return null;
   }
 
-  const parsed = new Date(`${date}T00:00:00Z`);
+  const parsed = new Date(
+    `${date}T00:00:00Z`
+  );
 
-  return !Number.isNaN(parsed.getTime()) &&
-    parsed.toISOString().slice(0, 10) === date
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+
+  return parsed.toISOString().slice(0, 10) === date
     ? date
     : null;
 }
@@ -74,13 +94,13 @@ function normalizeDate(value: string | null) {
 function normalizeExtraction(
   raw: z.infer<typeof extractionSchema>
 ) {
-  const pinCandidate = normalize(raw.pin)?.replace(
-    /[\s-]/g,
-    ""
-  );
+  const pinCandidate = normalize(
+    raw.pin
+  )?.replace(/[\s-]/g, "");
 
   const pin =
-    pinCandidate && /^\d{12}$/.test(pinCandidate)
+    pinCandidate &&
+    /^\d{12}$/.test(pinCandidate)
       ? pinCandidate
       : null;
 
@@ -92,24 +112,90 @@ function normalizeExtraction(
 
   const transactionNumber =
     transactionCandidate &&
-    /^[A-Z0-9]{8,32}$/.test(transactionCandidate)
+    /^[A-Z0-9]{8,32}$/.test(
+      transactionCandidate
+    )
       ? transactionCandidate
       : null;
 
-  const bounded = (value: string | null, limit: number) => {
+  const bounded = (
+    value: string | null,
+    limit: number
+  ) => {
     const text = normalize(value);
-    return text && text.length <= limit ? text : null;
+
+    return text && text.length <= limit
+      ? text
+      : null;
   };
 
   return {
     transactionNumber,
     pin,
-    firstName: bounded(raw.firstName, 100),
-    middleName: bounded(raw.middleName, 100),
-    lastName: bounded(raw.lastName, 100),
-    birthDate: normalizeDate(raw.birthDate),
-    errorCode: bounded(raw.errorCode, 100),
-    assignedClinic: bounded(raw.assignedClinic, 500),
+
+    firstName: bounded(
+      raw.firstName,
+      100
+    ),
+
+    middleName: bounded(
+      raw.middleName,
+      100
+    ),
+
+    lastName: bounded(
+      raw.lastName,
+      100
+    ),
+
+    birthDate: normalizeDate(
+      raw.birthDate
+    ),
+
+    errorCode: bounded(
+      raw.errorCode,
+      100
+    ),
+
+    assignedClinic: bounded(
+      raw.assignedClinic,
+      500
+    ),
+  };
+}
+
+// =====================================================
+// SAFE ERROR DIAGNOSTICS
+// =====================================================
+
+function getErrorDiagnostics(error: unknown) {
+  if (
+    typeof error !== "object" ||
+    error === null
+  ) {
+    return {
+      errorType: "UNKNOWN",
+      code: null,
+      httpStatus: null,
+    };
+  }
+
+  const err = error as {
+    name?: string;
+    code?: string | number;
+    status?: number;
+    response?: {
+      status?: number;
+    };
+  };
+
+  return {
+    errorType: err.name ?? "UNKNOWN",
+    code: err.code ?? null,
+    httpStatus:
+      err.response?.status ??
+      err.status ??
+      null,
   };
 }
 
@@ -118,14 +204,27 @@ function normalizeExtraction(
 // =====================================================
 
 export async function POST(request: Request) {
-  console.info("PCU_WORKER_RESULT_REQUEST_RECEIVED");
+  console.info(
+    "PCU_WORKER_RESULT_REQUEST_RECEIVED"
+  );
+
+  // ---------------------------------------------------
+  // 1. AUTHENTICATE PRIVATE WORKER
+  // ---------------------------------------------------
 
   if (!isAuthorizedWorker(request)) {
     return NextResponse.json(
-      { error: "Unauthorized" },
+      {
+        success: false,
+        error: "Unauthorized",
+      },
       { status: 401 }
     );
   }
+
+  // ---------------------------------------------------
+  // 2. VALIDATE PAYLOAD
+  // ---------------------------------------------------
 
   const parsed = payloadSchema.safeParse(
     await request.json().catch(() => null)
@@ -133,36 +232,68 @@ export async function POST(request: Request) {
 
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "Invalid worker result." },
+      {
+        success: false,
+        error: "Invalid worker result.",
+      },
       { status: 400 }
     );
   }
 
   const payload = parsed.data;
 
+  // ---------------------------------------------------
+  // 3. VERIFY ACTIVE WORKER LEASE
+  // ---------------------------------------------------
+
   const conditions = and(
-    eq(pcuSubmissions.id, payload.submissionId),
-    eq(pcuSubmissions.aiStatus, "PROCESSING"),
-    eq(pcuSubmissions.aiLeaseToken, payload.leaseToken),
-    gt(pcuSubmissions.aiLeaseExpiresAt, new Date()),
-    eq(pcuSubmissions.submittedOutcome, "SUCCESS"),
-    eq(pcuSubmissions.verificationStatus, "PENDING")
+    eq(
+      pcuSubmissions.id,
+      payload.submissionId
+    ),
+
+    eq(
+      pcuSubmissions.aiStatus,
+      "PROCESSING"
+    ),
+
+    eq(
+      pcuSubmissions.aiLeaseToken,
+      payload.leaseToken
+    ),
+
+    gt(
+      pcuSubmissions.aiLeaseExpiresAt,
+      new Date()
+    ),
+
+    eq(
+      pcuSubmissions.submittedOutcome,
+      "SUCCESS"
+    ),
+
+    eq(
+      pcuSubmissions.verificationStatus,
+      "PENDING"
+    )
   );
 
   try {
     // =================================================
-    // FAILED EXTRACTION
+    // 4. FAILED EXTRACTION
     // =================================================
 
     if (payload.status === "FAILED") {
-      // The UPDATE is conditional on the lease.
       const [updated] = await db
         .update(pcuSubmissions)
         .set({
           aiStatus: "PENDING",
+
           aiLeaseToken: null,
           aiLeaseExpiresAt: null,
+
           aiLastError: payload.errorCode,
+
           updatedAt: new Date(),
         })
         .where(conditions)
@@ -173,12 +304,19 @@ export async function POST(request: Request) {
 
       if (!updated) {
         return NextResponse.json(
-          { error: "Job lease invalid or expired." },
+          {
+            success: false,
+            error:
+              "Job lease invalid or expired.",
+          },
           { status: 409 }
         );
       }
 
-      if (updated.attempts >= MAX_ATTEMPTS) {
+      // Retry only up to the configured limit.
+      if (
+        updated.attempts >= MAX_ATTEMPTS
+      ) {
         await db
           .update(pcuSubmissions)
           .set({
@@ -187,20 +325,40 @@ export async function POST(request: Request) {
           })
           .where(
             and(
-              eq(pcuSubmissions.id, updated.id),
-              eq(pcuSubmissions.aiStatus, "PENDING")
+              eq(
+                pcuSubmissions.id,
+                updated.id
+              ),
+
+              eq(
+                pcuSubmissions.aiStatus,
+                "PENDING"
+              )
             )
           );
       }
 
+      console.info(
+        "PCU_WORKER_EXTRACTION_FAILED",
+        {
+          reference: updated.id,
+          errorCode: payload.errorCode,
+          attempts: updated.attempts,
+          retryAllowed:
+            updated.attempts < MAX_ATTEMPTS,
+        }
+      );
+
       return NextResponse.json({
         success: true,
-        retryAllowed: updated.attempts < MAX_ATTEMPTS,
+        reference: updated.id,
+        retryAllowed:
+          updated.attempts < MAX_ATTEMPTS,
       });
     }
 
     // =================================================
-    // SUCCESSFUL EXTRACTION
+    // 5. SUCCESSFUL EXTRACTION
     // =================================================
 
     const extracted = normalizeExtraction(
@@ -212,30 +370,51 @@ export async function POST(request: Request) {
       extracted
     );
 
-    // Accept results only from the active lease.
-    // RHU-reviewed records cannot be overwritten.
+    // Save AI results only if this worker still
+    // owns the active lease.
+    //
+    // RHU-reviewed submissions cannot be
+    // overwritten by delayed worker results.
 
     const [saved] = await db
       .update(pcuSubmissions)
       .set({
-        transactionNumber: extracted.transactionNumber,
-        extractedPin: extracted.pin,
-        firstName: extracted.firstName,
-        middleName: extracted.middleName,
-        lastName: extracted.lastName,
-        birthDate: extracted.birthDate,
-        assignedClinic: extracted.assignedClinic,
-        errorCode: extracted.errorCode,
+        transactionNumber:
+          extracted.transactionNumber,
+
+        extractedPin:
+          extracted.pin,
+
+        firstName:
+          extracted.firstName,
+
+        middleName:
+          extracted.middleName,
+
+        lastName:
+          extracted.lastName,
+
+        birthDate:
+          extracted.birthDate,
+
+        assignedClinic:
+          extracted.assignedClinic,
+
+        errorCode:
+          extracted.errorCode,
 
         classification,
 
         aiStatus: "COMPLETED",
+
         aiProcessedAt: new Date(),
+
         aiLeaseToken: null,
         aiLeaseExpiresAt: null,
         aiLastError: null,
 
         sheetSyncStatus: "PENDING",
+
         updatedAt: new Date(),
       })
       .where(conditions)
@@ -244,6 +423,7 @@ export async function POST(request: Request) {
     if (!saved) {
       return NextResponse.json(
         {
+          success: false,
           error:
             "Job lease invalid, expired, or already reviewed.",
         },
@@ -251,16 +431,25 @@ export async function POST(request: Request) {
       );
     }
 
-    console.info("PCU_WORKER_EXTRACTION_SAVED", {
-      reference: saved.id,
-      classification: saved.classification,
-    });
+    console.info(
+      "PCU_WORKER_EXTRACTION_SAVED",
+      {
+        reference: saved.id,
+        classification:
+          saved.classification,
+        hasSubmitter:
+          Boolean(saved.submittedBy),
+      }
+    );
 
     // =================================================
-    // GOOGLE SHEETS SYNCHRONIZATION
+    // 6. GOOGLE SHEETS SYNCHRONIZATION
     // =================================================
 
     let sheetsWritten = false;
+
+    let syncStatusRecorded = false;
+
     let targetSheet: string | null = null;
 
     try {
@@ -272,29 +461,71 @@ export async function POST(request: Request) {
         .filter(Boolean)
         .join(" ");
 
-      const result = await syncSubmissionToSheets({
-        id: saved.id,
-        submittedAt: saved.submittedAt,
-        barangay: saved.barangay,
-        submittedBy: saved.submittedBy,
-        outcome: saved.submittedOutcome,
-        classification: saved.classification,
-        transactionNumber: saved.transactionNumber,
-        fullName,
-        birthDate: saved.birthDate,
-        pin: saved.extractedPin,
-        assignedClinic: saved.assignedClinic,
-        errorCode: saved.errorCode,
-        verificationStatus: saved.verificationStatus,
-      });
-      console.info("PCU_SHEETS_SYNC_DIAGNOSTIC", {
-        submissionId: saved.id,
-        success: result.success,
-        targetSheet: result.targetSheet ?? null,
+      const result =
+        await syncSubmissionToSheets({
+          id: saved.id,
+
+          submittedAt:
+            saved.submittedAt,
+
+          barangay:
+            saved.barangay,
+
+          // NEW:
+          // BHW / Encoder who submitted
+          // the screenshot.
+          submittedBy:
+            saved.submittedBy,
+
+          outcome:
+            saved.submittedOutcome,
+
+          classification:
+            saved.classification,
+
+          transactionNumber:
+            saved.transactionNumber,
+
+          fullName,
+
+          birthDate:
+            saved.birthDate,
+
+          pin:
+            saved.extractedPin,
+
+          assignedClinic:
+            saved.assignedClinic,
+
+          errorCode:
+            saved.errorCode,
+
+          verificationStatus:
+            saved.verificationStatus,
         });
 
       sheetsWritten = result.success;
-      targetSheet = result.targetSheet;
+
+      targetSheet =
+        result.targetSheet ?? null;
+
+      console.info(
+        "PCU_SHEETS_SYNC_DIAGNOSTIC",
+        {
+          submissionId: saved.id,
+
+          success: result.success,
+
+          targetSheet,
+
+          hasSubmitter:
+            Boolean(saved.submittedBy),
+        }
+      );
+
+      // -----------------------------------------------
+      // 7. UPDATE NEON SHEET SYNC STATUS
+      // -----------------------------------------------
 
       if (sheetsWritten) {
         await db
@@ -303,65 +534,85 @@ export async function POST(request: Request) {
             sheetSyncStatus: "SYNCED",
             updatedAt: new Date(),
           })
-          .where(eq(pcuSubmissions.id, saved.id));
+          .where(
+            eq(
+              pcuSubmissions.id,
+              saved.id
+            )
+          );
+
+        syncStatusRecorded = true;
       }
-    } catch (error) {
-      console.error("PCU_WORKER_SHEETS_SYNC_FAILED", {
-        errorType:
-          error instanceof Error
-            ? error.name
-            : "UNKNOWN",
-      });
+    } catch (error: unknown) {
+      // Google Sheets or sync-status update failure
+      // must not undo a completed AI extraction.
+
+      console.error(
+        "PCU_WORKER_SHEETS_SYNC_FAILED",
+        {
+          submissionId: saved.id,
+          ...getErrorDiagnostics(error),
+        }
+      );
     }
 
     // =================================================
-    // RESPONSE
+    // 8. RETURN RESPONSE
     // =================================================
 
     return NextResponse.json({
       success: true,
+
       reference: saved.id,
+
       aiStatus: "COMPLETED",
+
       classification,
-      verificationStatus: saved.verificationStatus,
-      sheetSyncStatus: sheetsWritten
-        ? "SYNCED"
-        : "PENDING",
-      targetSheet: sheetsWritten ? targetSheet : null,
+
+      verificationStatus:
+        saved.verificationStatus,
+
+      sheetSyncStatus:
+        syncStatusRecorded
+          ? "SYNCED"
+          : "PENDING",
+
+      targetSheet:
+        syncStatusRecorded
+          ? targetSheet
+          : null,
+
       requiresReview: true,
     });
- 
-} catch (error: unknown) {
-  const err = error as {
-    name?: string;
-    message?: string;
-    code?: string | number;
-    status?: number;
-    response?: {
-      status?: number;
-    };
-  };
+  } catch (error: unknown) {
+    // =================================================
+    // 9. FINAL ERROR HANDLER
+    // =================================================
 
-  // Log only predefined diagnostic fields.
-  // Do not log raw error objects or messages:
-  // they could contain sensitive request data.
-  console.error("PCU_WORKER_SHEETS_SYNC_FAILED", {
-    errorType: err.name ?? "UNKNOWN",
-    code: err.code ?? null,
-    httpStatus:
-      err.response?.status ??
-      err.status ??
-      null,
-    messageCategory:
-      typeof err.message === "string"
-        ? err.message.includes("GOOGLE")
-          ? "GOOGLE_CONFIGURATION"
-          : err.message.includes("SPREADSHEET")
-            ? "SPREADSHEET_CONFIGURATION"
-            : err.message.includes("credential")
-              ? "CREDENTIAL_CONFIGURATION"
-              : "UNCLASSIFIED"
-        : "UNKNOWN",
-  });
-}
+    // This catches unexpected worker-result
+    // processing errors, including database errors.
+    //
+    // Never log raw extraction data or patient
+    // information.
+
+    console.error(
+      "PCU_WORKER_RESULT_FAILED",
+      {
+        submissionId:
+          payload.submissionId,
+
+        ...getErrorDiagnostics(error),
+      }
+    );
+
+    return NextResponse.json(
+      {
+        success: false,
+
+        error:
+          "Worker result processing failed.",
+      },
+      { status: 500 }
+    );
+  }
 }
