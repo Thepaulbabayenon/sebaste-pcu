@@ -17,8 +17,15 @@ export type SheetSubmission = {
   id: string;
   submittedAt: Date;
   barangay: string;
+
+  // BHW / encoder who submitted the screenshot.
+  // Optional for compatibility with older sync callers
+  // and historical submissions.
+  submittedBy?: string | null;
+
   outcome: PCUOutcome;
   classification: PCUClassification;
+
   transactionNumber: string | null;
   fullName: string;
   birthDate: string | null;
@@ -50,7 +57,9 @@ const PCU_SHEETS: readonly PCUSheetName[] = [
   "PCU_FAILED",
 ];
 
-const HEADERS = [
+// Existing 12 columns.
+// These must retain their original positions.
+const LEGACY_HEADERS = [
   "Submission ID",
   "Submitted At",
   "Barangay",
@@ -63,6 +72,13 @@ const HEADERS = [
   "Assigned Clinic",
   "Error Code",
   "Verification Status",
+];
+
+// Add the new field at column M.
+// Never shift existing columns automatically.
+const HEADERS = [
+  ...LEGACY_HEADERS,
+  "Submitted By",
 ];
 
 const GOOGLE_SHEETS_SCOPE =
@@ -85,14 +101,52 @@ function getSpreadsheetId(): string {
 }
 
 function getSheets() {
-  const auth = new google.auth.GoogleAuth({
-    keyFile: path.join(
-      process.cwd(),
-      "credentials",
-      "google-service-account.json"
-    ),
-    scopes: [GOOGLE_SHEETS_SCOPE],
-  });
+  const email =
+    process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL?.trim();
+
+  const rawKey =
+    process.env.GOOGLE_PRIVATE_KEY;
+
+  const hasEmail = Boolean(email);
+  const hasKey = Boolean(rawKey?.trim());
+
+  if (hasEmail !== hasKey) {
+    throw new Error(
+      "GOOGLE_SERVICE_ACCOUNT_CONFIGURATION_INCOMPLETE"
+    );
+  }
+
+  let auth: InstanceType<
+    typeof google.auth.GoogleAuth
+  >;
+
+  if (email && rawKey) {
+    // Supports keys with literal \n characters
+    // as well as actual multiline private keys.
+    const privateKey = rawKey
+      .trim()
+      .replace(/^["']|["']$/g, "")
+      .replace(/\\n/g, "\n");
+
+    auth = new google.auth.GoogleAuth({
+      credentials: {
+        client_email: email,
+        private_key: privateKey,
+      },
+      scopes: [GOOGLE_SHEETS_SCOPE],
+    });
+  } else {
+    // Local development fallback.
+    // Vercel should use environment credentials.
+    auth = new google.auth.GoogleAuth({
+      keyFile: path.join(
+        process.cwd(),
+        "credentials",
+        "google-service-account.json"
+      ),
+      scopes: [GOOGLE_SHEETS_SCOPE],
+    });
+  }
 
   return google.sheets({
     version: "v4",
@@ -119,8 +173,8 @@ function safeCell(
 ): string {
   const text = normalizeText(value);
 
-  // Prevent spreadsheet formula injection.
-  if (/^\s*[=+\-@]/.test(text)) {
+  // Prevent formula injection when writing to Sheets.
+  if (/^[=+\-@]/.test(text)) {
     return "'" + text;
   }
 
@@ -151,7 +205,9 @@ function validBirthDate(
     return false;
   }
 
-  const parsed = new Date(`${date}T00:00:00Z`);
+  const parsed = new Date(
+    `${date}T00:00:00Z`
+  );
 
   return (
     !Number.isNaN(parsed.getTime()) &&
@@ -164,8 +220,6 @@ function validPatientName(name: string): boolean {
     .split(/\s+/)
     .filter(Boolean);
 
-  // Basic completeness check.
-  // Names are not independently identity-verified.
   return (
     parts.length >= 2 &&
     parts.every((part) => part.length > 0)
@@ -192,10 +246,9 @@ function isNotAssignedClinic(
 ): boolean {
   const clinic = normalizeText(value);
 
-  // Must explicitly indicate no assignment.
-  // A completely empty field does not qualify.
-  return /^(?:not\s*(?:yet\s*)?assigned|unassigned|no\s*(?:assigned\s*)?(?:facility|clinic))(?:[.!])?$/i
-    .test(clinic);
+  return /^(?:not\s*(?:yet\s*)?assigned|unassigned|no\s*(?:assigned\s*)?(?:facility|clinic))(?:[.!])?$/i.test(
+    clinic
+  );
 }
 
 function isSebasteClinic(
@@ -207,21 +260,21 @@ function isSebasteClinic(
     return false;
   }
 
-  // Do not accept negated clinic assignments.
   if (
-    /\b(?:not assigned|unassigned|not registered)\b/i
-      .test(clinic)
+    /\b(?:not assigned|unassigned|not registered)\b/i.test(
+      clinic
+    )
   ) {
     return false;
   }
 
-  // Require explicit Sebaste + relevant
-  // facility terminology.
-  const hasSebaste = /\bsebaste\b/i.test(clinic);
+  const hasSebaste =
+    /\bsebaste\b/i.test(clinic);
 
   const hasClinic =
-    /\b(?:yakap|clinic|rhu|rural health unit|health center)\b/i
-      .test(clinic);
+    /\b(?:yakap|clinic|rhu|rural health unit|health center)\b/i.test(
+      clinic
+    );
 
   return hasSebaste && hasClinic;
 }
@@ -230,27 +283,11 @@ function isSebasteClinic(
 // DESTINATION VALIDATION
 // =====================================================
 
-/**
- * Determine destination using:
- *
- * 1. User-submitted outcome
- * 2. Stored classification
- * 3. Extracted patient details
- * 4. Explicit clinic assignment
- *
- * Do not infer "Not Assigned" from a blank clinic.
- *
- * Do not route other clinics into PCU_SUCCESS.
- */
 export function getTargetSheet(
   data: SheetSubmission
 ): CategorySheet | null {
   const outcome = data.outcome;
   const classification = data.classification;
-
-  // ----------------------------------------------
-  // FAILED
-  // ----------------------------------------------
 
   if (outcome === "FAILED") {
     return "PCU_FAILED";
@@ -260,21 +297,17 @@ export function getTargetSheet(
     return null;
   }
 
-  // Contradictory AI classification requires review.
   if (classification === "FAILED") {
     return null;
   }
 
-  // ----------------------------------------------
-  // VALIDATE SUCCESS DETAILS
-  // ----------------------------------------------
-
+  // Successful records require complete AI extraction
+  // before being added to a category worksheet.
   if (!completePatientDetails(data)) {
     return null;
   }
 
-  // Explicit classifications for other clinics
-  // or unknown clinics must not be overwritten.
+  // Other/unknown clinics remain in ALL_SUBMISSIONS.
   if (
     classification === "SUCCESS_OTHER_CLINIC" ||
     classification === "SUCCESS_NO_CLINIC"
@@ -290,10 +323,6 @@ export function getTargetSheet(
     data.assignedClinic
   );
 
-  // ----------------------------------------------
-  // NOT ASSIGNED
-  // ----------------------------------------------
-
   if (notAssigned) {
     if (classification === "SUCCESS_SEBASTE") {
       return null;
@@ -301,10 +330,6 @@ export function getTargetSheet(
 
     return "PCU_NOT_ASSIGNED";
   }
-
-  // ----------------------------------------------
-  // SEBASTE SUCCESS
-  // ----------------------------------------------
 
   if (sebaste) {
     if (
@@ -316,8 +341,6 @@ export function getTargetSheet(
     return "PCU_SUCCESS";
   }
 
-  // Other clinics, blank clinics and uncertain
-  // records remain in ALL_SUBMISSIONS only.
   return null;
 }
 
@@ -360,23 +383,44 @@ function buildRow(
     getResolvedClassification(data, target);
 
   return [
+    // A - Submission ID
     data.id,
+
+    // B - Submitted At
     data.submittedAt.toISOString(),
+
+    // C - Barangay
     data.barangay,
+
+    // D - Outcome
     data.outcome,
+
+    // E - Classification
     resolvedClassification,
+
+    // F - Transaction Number
     data.transactionNumber ?? "",
+
+    // G - Patient Name
     data.fullName,
+
+    // H - Birthdate
     data.birthDate ?? "",
 
-    // Failed submissions must not have a PIN
-    // or assigned clinic in Google Sheets.
+    // I - PIN
     failed ? "" : normalizePin(data.pin),
 
+    // J - Assigned Clinic
     failed ? "" : data.assignedClinic ?? "",
 
+    // K - Error Code
     data.errorCode ?? "",
+
+    // L - RHU Verification
     data.verificationStatus,
+
+    // M - BHW / Encoder name
+    data.submittedBy ?? "",
   ].map(safeCell);
 }
 
@@ -385,11 +429,14 @@ function buildRow(
 // =====================================================
 
 /**
- * Creates only missing PCU worksheets.
+ * Creates missing PCU worksheets.
  *
- * Existing PKRF worksheets remain untouched.
- * Existing PCU headers must match this app's
- * expected 12-column layout.
+ * Preserves existing PKRF worksheets.
+ *
+ * Accepts existing 12-column PCU worksheets,
+ * then safely adds Submitted By in column M.
+ *
+ * Never rewrites existing patient data.
  */
 export async function ensurePCUSheets() {
   const spreadsheetId = getSpreadsheetId();
@@ -397,7 +444,7 @@ export async function ensurePCUSheets() {
 
   const metadata = await sheets.spreadsheets.get({
     spreadsheetId,
-    fields: "sheets.properties(title)",
+    fields: "sheets.properties(title,gridProperties(columnCount))",
   });
 
   const existing = new Set(
@@ -429,22 +476,23 @@ export async function ensurePCUSheets() {
   }
 
   for (const name of PCU_SHEETS) {
-    const range =
-      `${quoteSheetName(name)}!A1:L1`;
+    const quoted = quoteSheetName(name);
 
+    // Read A-M so the new column is visible.
     const response =
       await sheets.spreadsheets.values.get({
         spreadsheetId,
-        range,
+        range: `${quoted}!A1:M1`,
       });
 
     const currentHeaders =
       response.data.values?.[0] ?? [];
 
     if (currentHeaders.length === 0) {
+      // New worksheet: initialize all 13 columns.
       await sheets.spreadsheets.values.update({
         spreadsheetId,
-        range,
+        range: `${quoted}!A1:M1`,
         valueInputOption: "RAW",
         requestBody: {
           values: [HEADERS],
@@ -454,18 +502,48 @@ export async function ensurePCUSheets() {
       continue;
     }
 
-    const correct = HEADERS.every(
-      (header, index) =>
-        currentHeaders[index] === header
-    );
+    // Existing A-L headers must be unchanged.
+    const legacyCorrect =
+      LEGACY_HEADERS.every(
+        (header, index) =>
+          currentHeaders[index] === header
+      );
 
-    if (!correct) {
+    if (!legacyCorrect) {
       throw new Error(
-        `Header mismatch in ${name}. ` +
-        "Existing headers were preserved. " +
-        "Do not overwrite this sheet automatically."
+        `PCU_HEADER_MISMATCH:${name}`
       );
     }
+
+    // Column M may already exist.
+    const submittedByHeader =
+      currentHeaders[12] ?? "";
+
+    if (submittedByHeader === "Submitted By") {
+      continue;
+    }
+
+    if (submittedByHeader !== "") {
+      // Never overwrite an existing unrelated column.
+      throw new Error(
+        `PCU_SUBMITTER_COLUMN_CONFLICT:${name}`
+      );
+    }
+
+    // Safe upgrade: only write the new header cell.
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `${quoted}!M1`,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [["Submitted By"]],
+      },
+    });
+
+    console.info("PCU_SHEET_HEADER_UPGRADED", {
+      worksheet: name,
+      addedColumn: "M",
+    });
   }
 }
 
@@ -474,10 +552,11 @@ export async function ensurePCUSheets() {
 // =====================================================
 
 /**
- * Updates an existing UUID or inserts a new row.
+ * Updates a row with the same submission UUID or
+ * appends a new row.
  *
- * RAW input preserves PIN leading zeros because
- * PINs are always passed as strings.
+ * RAW input prevents Sheets from interpreting
+ * patient PINs as numerical data.
  */
 async function upsertRow(
   sheetName: PCUSheetName,
@@ -486,6 +565,7 @@ async function upsertRow(
 ) {
   const spreadsheetId = getSpreadsheetId();
   const sheets = getSheets();
+
   const quoted = quoteSheetName(sheetName);
 
   const response =
@@ -494,7 +574,8 @@ async function upsertRow(
       range: `${quoted}!A2:A`,
     });
 
-  const existingRows = response.data.values ?? [];
+  const existingRows =
+    response.data.values ?? [];
 
   const index = existingRows.findIndex(
     (row) => row[0] === data.id
@@ -508,7 +589,7 @@ async function upsertRow(
     await sheets.spreadsheets.values.update({
       spreadsheetId,
       range:
-        `${quoted}!A${actualRow}:L${actualRow}`,
+        `${quoted}!A${actualRow}:M${actualRow}`,
       valueInputOption: "RAW",
       requestBody: { values },
     });
@@ -521,7 +602,7 @@ async function upsertRow(
 
   await sheets.spreadsheets.values.append({
     spreadsheetId,
-    range: `${quoted}!A:L`,
+    range: `${quoted}!A:M`,
     valueInputOption: "RAW",
     insertDataOption: "INSERT_ROWS",
     requestBody: { values },
@@ -538,19 +619,20 @@ async function upsertRow(
 // =====================================================
 
 /**
- * Call immediately after a submission has
- * been successfully saved to Neon.
+ * Every submission is written to ALL_SUBMISSIONS.
  *
- * Every submission goes to ALL_SUBMISSIONS.
+ * An eligible submission may also be written to
+ * one corresponding category worksheet.
  *
- * Eligible submissions also go into precisely
- * one operational category sheet.
+ * Existing UUIDs are updated rather than appended.
  */
 export async function syncSubmissionToSheets(
   data: SheetSubmission
 ) {
   if (!data.id) {
-    throw new Error("Submission ID is required");
+    throw new Error(
+      "Submission ID is required"
+    );
   }
 
   if (
@@ -562,20 +644,19 @@ export async function syncSubmissionToSheets(
     );
   }
 
-  // Determine the destination before writing.
   const target = getTargetSheet(data);
 
-  // Create/validate the four worksheets.
+  // Ensure expected worksheets and headers exist.
   await ensurePCUSheets();
 
-  // 1. Always synchronize ALL submissions.
+  // 1. All submissions.
   const allResult = await upsertRow(
     "PCU_ALL_SUBMISSIONS",
     data,
     target
   );
 
-  // 2. Synchronize the matching category.
+  // 2. Matching category.
   let categoryResult = null;
 
   if (target) {
@@ -586,8 +667,8 @@ export async function syncSubmissionToSheets(
     );
   }
 
-  // Avoid logging patient names, PINs,
-  // transaction numbers or screenshot text.
+  // Never log patient names, PINs,
+  // birthdates or screenshot contents.
   console.info("PCU_SHEETS_SYNC_COMPLETED", {
     submissionId: data.id,
     classification: getResolvedClassification(

@@ -1,4 +1,3 @@
-
 import { NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -24,9 +23,16 @@ import {
 
 const MAX_SIZE = 5 * 1024 * 1024;
 
+
 // =====================================================
 // FORM VALIDATION
 // =====================================================
+
+const submitterSchema = z
+  .string()
+  .trim()
+  .min(2)
+  .max(150);
 
 const submissionSchema = z.discriminatedUnion(
   "outcome",
@@ -34,11 +40,13 @@ const submissionSchema = z.discriminatedUnion(
     z.object({
       outcome: z.literal("SUCCESS"),
       barangay: z.enum(BARANGAYS),
+      submittedBy: submitterSchema,
     }),
 
     z.object({
       outcome: z.literal("FAILED"),
       barangay: z.enum(BARANGAYS),
+      submittedBy: submitterSchema,
 
       firstName: z.string().trim().min(1).max(100),
       middleName: z.string().trim().max(100),
@@ -68,7 +76,6 @@ async function validateImage(
     throw new Error("INVALID_IMAGE_FORMAT");
   }
 
-  // Decode the image to verify that it is valid.
   await image.stats();
 
   return metadata.format === "png"
@@ -98,6 +105,10 @@ export async function POST(request: Request) {
     const parsed = submissionSchema.safeParse({
       outcome: form.get("outcome"),
       barangay: form.get("barangay"),
+
+      // New: BHW or encoder identity
+      submittedBy: form.get("submittedBy"),
+
       firstName: form.get("firstName"),
       middleName: form.get("middleName") ?? "",
       lastName: form.get("lastName"),
@@ -163,8 +174,6 @@ export async function POST(request: Request) {
 
     const failed = parsed.data.outcome === "FAILED";
 
-    // Explicit discriminated-union narrowing
-    // prevents TypeScript TS2339 errors.
     let patientFields: {
       firstName: string | null;
       middleName: string | null;
@@ -173,8 +182,6 @@ export async function POST(request: Request) {
     };
 
     if (parsed.data.outcome === "FAILED") {
-      // Failed registrations already have manually
-      // entered patient information.
       patientFields = {
         firstName: parsed.data.firstName,
         middleName: parsed.data.middleName || null,
@@ -182,8 +189,8 @@ export async function POST(request: Request) {
         birthDate: parsed.data.birthDate,
       };
     } else {
-      // Successful registrations will receive
-      // extracted details from the MacBook worker.
+      // SUCCESS details are extracted later
+      // by the local MacBook AI worker.
       patientFields = {
         firstName: null,
         middleName: null,
@@ -192,14 +199,10 @@ export async function POST(request: Request) {
       };
     }
 
-    // Failed transactions do not require OCR.
-    // Successful transactions enter the AI queue.
     const aiStatus = failed
       ? ("SKIPPED" as const)
       : ("PENDING" as const);
 
-    // Classification remains provisional
-    // until processing and/or RHU review.
     const classification = failed
       ? ("FAILED" as const)
       : ("MANUAL_REVIEW" as const);
@@ -226,6 +229,8 @@ export async function POST(request: Request) {
       .values({
         barangay: parsed.data.barangay,
 
+        submittedBy: parsed.data.submittedBy,
+
         submittedOutcome: parsed.data.outcome,
 
         ...patientFields,
@@ -240,14 +245,10 @@ export async function POST(request: Request) {
         screenshotKey,
 
         classification,
-
         verificationStatus: "PENDING",
-
         sheetSyncStatus: "PENDING",
 
-        // -----------------------------------------
         // PRIVATE AI WORKER QUEUE
-        // -----------------------------------------
 
         aiStatus,
         aiAttempts: 0,
@@ -271,18 +272,18 @@ export async function POST(request: Request) {
       reference: saved.id,
       outcome: saved.submittedOutcome,
       aiStatus,
+      hasSubmitter: Boolean(saved.submittedBy),
     });
 
     // -------------------------------------------------
     // 6. GOOGLE SHEETS SYNCHRONIZATION
     // -------------------------------------------------
 
-    // SUCCESS submissions:
-    // Wait until the worker returns AI results.
+    // SUCCESS:
+    // Wait for asynchronous AI extraction.
     //
-    // FAILED submissions:
-    // Preserve immediate Google Sheets sync
-    // using manually entered patient information.
+    // FAILED:
+    // Sync using manually entered patient details.
 
     let sheetsWritten = false;
     let syncStatusRecorded = false;
@@ -304,6 +305,7 @@ export async function POST(request: Request) {
           id: saved.id,
           submittedAt: saved.submittedAt,
           barangay: saved.barangay,
+          submittedBy: saved.submittedBy,
           outcome: saved.submittedOutcome,
           classification: saved.classification,
           transactionNumber: saved.transactionNumber,
@@ -380,11 +382,11 @@ export async function POST(request: Request) {
             "AI extraction is queued for processing.",
 
         reference: saved.id,
+        submittedBy: saved.submittedBy,
 
         classification: saved.classification,
 
-        verificationStatus:
-          saved.verificationStatus,
+        verificationStatus: saved.verificationStatus,
 
         targetSheet: sheetsWritten
           ? targetSheet
@@ -432,17 +434,17 @@ export async function POST(request: Request) {
       traceId,
       reference: savedReference,
       step: currentStep,
+
       errorType:
         error instanceof Error
           ? error.name
           : "UNKNOWN",
+
       databaseCode: dbError?.code ?? null,
       column: dbError?.column ?? null,
       constraint: dbError?.constraint ?? null,
     });
 
-    // Delete an orphaned screenshot only if
-    // the database record was not persisted.
     if (!persisted && screenshotKey) {
       await deleteScreenshot(screenshotKey).catch(() => {
         console.error("SCREENSHOT_CLEANUP_FAILED", {

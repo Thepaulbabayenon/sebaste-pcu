@@ -1,4 +1,3 @@
-
 import {
   pgTable,
   pgEnum,
@@ -44,7 +43,6 @@ export const verificationEnum = pgEnum(
   ]
 );
 
-// Tracks asynchronous AI extraction.
 export const aiStatusEnum = pgEnum("pcu_ai_status", [
   "PENDING",
   "PROCESSING",
@@ -66,13 +64,17 @@ export const pcuSubmissions = pgTable(
       length: 100,
     }).notNull(),
 
+    // BHW or encoder responsible for submission.
+    // Nullable to preserve historical records.
+    submittedBy: varchar("submitted_by", {
+      length: 150,
+    }),
+
     submittedOutcome: outcomeEnum(
       "submitted_outcome"
     ).notNull(),
 
-    // -------------------------------------------------
     // PATIENT INFORMATION
-    // -------------------------------------------------
 
     firstName: varchar("first_name", {
       length: 100,
@@ -107,9 +109,7 @@ export const pcuSubmissions = pgTable(
 
     assignedClinic: text("assigned_clinic"),
 
-    // -------------------------------------------------
-    // PRIVATE SCREENSHOT STORAGE
-    // -------------------------------------------------
+    // SCREENSHOT STORAGE
 
     screenshotKey: text(
       "screenshot_key"
@@ -117,9 +117,7 @@ export const pcuSubmissions = pgTable(
 
     ocrRawText: text("ocr_raw_text"),
 
-    // -------------------------------------------------
-    // CLASSIFICATION AND RHU VERIFICATION
-    // -------------------------------------------------
+    // CLASSIFICATION
 
     classification: classificationEnum(
       "classification"
@@ -140,44 +138,33 @@ export const pcuSubmissions = pgTable(
       .notNull()
       .default("PENDING"),
 
-    // -------------------------------------------------
-    // PRIVATE AI WORKER QUEUE
-    // -------------------------------------------------
+    // PRIVATE AI WORKER
 
     aiStatus: aiStatusEnum("ai_status")
       .notNull()
       .default("PENDING"),
 
-    // Number of times a worker claimed the job.
     aiAttempts: integer("ai_attempts")
       .notNull()
       .default(0),
 
-    // Unique token assigned to the current claim.
-    // Must be checked by the result endpoint.
     aiLeaseToken: uuid("ai_lease_token"),
 
-    // Expiration of the current worker claim.
     aiLeaseExpiresAt: timestamp(
       "ai_lease_expires_at",
       { withTimezone: true }
     ),
 
-    // Time AI extraction was successfully completed.
     aiProcessedAt: timestamp(
       "ai_processed_at",
       { withTimezone: true }
     ),
 
-    // Safe internal error code only.
-    // Never store sensitive exception details here.
     aiLastError: varchar("ai_last_error", {
       length: 100,
     }),
 
-    // -------------------------------------------------
     // TIMESTAMPS
-    // -------------------------------------------------
 
     submittedAt: timestamp("submitted_at", {
       withTimezone: true,
@@ -192,8 +179,10 @@ export const pcuSubmissions = pgTable(
       .defaultNow(),
   },
   (table) => [
-    index("pcu_barangay_idx").on(
-      table.barangay
+    index("pcu_barangay_idx").on(table.barangay),
+
+    index("pcu_submitted_by_idx").on(
+      table.submittedBy
     ),
 
     index("pcu_submission_date_idx").on(
@@ -259,29 +248,26 @@ export const registrationCases = pgTable(
 // AUDIT LOGS
 // =====================================================
 
-export const auditLogs = pgTable(
-  "audit_logs",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
+export const auditLogs = pgTable("audit_logs", {
+  id: uuid("id").primaryKey().defaultRandom(),
 
-    submissionId: uuid(
-      "submission_id"
-    ).references(() => pcuSubmissions.id),
+  submissionId: uuid(
+    "submission_id"
+  ).references(() => pcuSubmissions.id),
 
-    action: varchar("action", {
-      length: 100,
-    }).notNull(),
+  action: varchar("action", {
+    length: 100,
+  }).notNull(),
 
-    actor: varchar("actor", {
-      length: 100,
-    }).notNull(),
+  actor: varchar("actor", {
+    length: 100,
+  }).notNull(),
 
-    details: text("details"),
+  details: text("details"),
 
-    createdAt: timestamp("created_at", {
-      withTimezone: true,
-    })
-      .notNull()
-      .defaultNow(),
-  }
-);
+  createdAt: timestamp("created_at", {
+    withTimezone: true,
+  })
+    .notNull()
+    .defaultNow(),
+});

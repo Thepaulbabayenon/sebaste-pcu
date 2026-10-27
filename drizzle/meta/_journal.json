@@ -29,6 +29,20 @@
       "when": 1792773166928,
       "tag": "0003_furry_squadron_supreme",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793113536022,
+      "tag": "0004_strange_scalphunter",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1793115162854,
+      "tag": "0005_supreme_chronomancer",
+      "breakpoints": true
     }
   ]
 }

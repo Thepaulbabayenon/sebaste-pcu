@@ -276,6 +276,7 @@ export async function POST(request: Request) {
         id: saved.id,
         submittedAt: saved.submittedAt,
         barangay: saved.barangay,
+        submittedBy: saved.submittedBy,
         outcome: saved.submittedOutcome,
         classification: saved.classification,
         transactionNumber: saved.transactionNumber,
